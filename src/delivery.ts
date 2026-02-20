@@ -258,7 +258,7 @@ export function createWebhookService(
                 lastDeliveredAt: now,
                 lastDeliveryStatus: status,
                 updatedAt: now,
-              })
+              } as any)
               .where(eq(webhooks.id, wh.id));
           } else {
             await db
@@ -267,7 +267,7 @@ export function createWebhookService(
                 lastFailedAt: now,
                 lastDeliveryStatus: status,
                 updatedAt: now,
-              })
+              } as any)
               .where(eq(webhooks.id, wh.id));
           }
         } catch (err) {
