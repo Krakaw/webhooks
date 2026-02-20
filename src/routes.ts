@@ -153,7 +153,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
         secret,
         events: events as string[],
         enabled: true,
-      })
+      } as any)
       .returning();
 
     logger.info({ webhookId: created.id, userId, url }, '[Webhooks] New webhook registered');
@@ -218,7 +218,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
       return c.json({ error: 'Invalid JSON body' }, 400);
     }
 
-    const updates: Partial<typeof webhooks.$inferInsert> = {
+    const updates: Record<string, any> = {
       updatedAt: new Date(),
     };
 
