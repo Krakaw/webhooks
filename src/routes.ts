@@ -40,7 +40,7 @@ export interface WebhookRoutesConfig<TEvent extends WebhookEventBase = string> {
     fireEvent: (event: TEvent, data: Record<string, unknown>, userId: string) => Promise<void>;
   };
   /** Auth middleware that sets c.get('userId') */
-  authMiddleware: (c: any, next: () => Promise<void>) => Promise<void | Response>;
+  authMiddleware: any;
   /** Valid event types for this project */
   validEvents: readonly TEvent[];
   /** Optional custom logger */
@@ -80,7 +80,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 
   // ─── GET / ────────────────────────────────────────────────────────────────
   app.get('/', async (c) => {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as string;
 
     const rows = await db
       .select({
@@ -103,7 +103,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 
   // ─── POST / ───────────────────────────────────────────────────────────────
   app.post('/', async (c) => {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as string;
 
     let body: { url?: string; name?: string; events?: unknown };
     try {
@@ -164,7 +164,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 
   // ─── GET /:id ─────────────────────────────────────────────────────────────
   app.get('/:id', async (c) => {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as string;
     const id = c.req.param('id');
 
     const [wh] = await db
@@ -192,7 +192,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 
   // ─── PATCH /:id ───────────────────────────────────────────────────────────
   app.patch('/:id', async (c) => {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as string;
     const id = c.req.param('id');
 
     // Verify ownership
@@ -278,7 +278,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 
   // ─── DELETE /:id ──────────────────────────────────────────────────────────
   app.delete('/:id', async (c) => {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as string;
     const id = c.req.param('id');
 
     const [deleted] = await db
@@ -297,7 +297,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 
   // ─── POST /:id/test ───────────────────────────────────────────────────────
   app.post('/:id/test', async (c) => {
-    const userId = c.get('userId');
+    const userId = c.get('userId') as string;
     const id = c.req.param('id');
 
     const [wh] = await db
