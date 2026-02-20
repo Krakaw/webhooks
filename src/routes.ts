@@ -73,7 +73,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
 ) {
   const { db, webhookService, authMiddleware, validEvents } = config;
   const logger = config.logger ?? defaultLogger;
-  const app = new Hono();
+  const app: any = new Hono();
 
   // All webhook routes require authentication
   app.use('*', authMiddleware);
