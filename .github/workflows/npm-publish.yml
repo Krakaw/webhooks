@@ -1,0 +1,25 @@
+name: Publish
+
+# Publishes @krakaw/webhooks to GitHub Packages when a semver tag is pushed.
+#
+# Usage:
+#   git tag v1.2.3 && git push --tags
+#
+# The reusable workflow lives in Krakaw/.github.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Publish @krakaw/webhooks
+    uses: Krakaw/.github/.github/workflows/npm-publish.yml@main
+    with:
+      node-version: '22'
+      # run-lint: false  # uncomment and set true once an ESLint config is added
+      # run-test: false  # uncomment and set true once tests are written
+    secrets:
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # GH_PAT: ${{ secrets.GH_PAT }}  # uncomment if private @krakaw/* deps are needed
