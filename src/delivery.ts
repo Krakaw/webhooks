@@ -6,19 +6,26 @@
  *
  * Security:
  *   Every payload is signed with HMAC-SHA256 using the webhook's stored secret.
- *   The signature is sent in the `X-{ProjectName}-Signature` header as `sha256=<hex>`.
+ *   The signature is sent in the `X-Webhook-Signature` header as `sha256=<hex>`.
  *   Consumers should verify the signature before processing events.
  *
  * Retry strategy:
- *   Up to MAX_RETRIES attempts with exponential back-off (1s, 2s, 4s by default).
- *   A delivery is considered successful if the target responds with 2xx.
- *   Failures are logged and the webhook's last_failed_at / last_delivery_status
- *   fields are updated so the user can diagnose issues.
+ *   - One immediate delivery attempt is made per webhook.
+ *   - On failure, the delivery is placed in the `webhook_dead_letter_queue`.
+ *   - The retry job (see retryJob.ts) processes the DLQ periodically.
+ *   - Retry schedule: +1 min, +5 min, +30 min (configurable).
+ *   - After MAX_DLQ_ATTEMPTS failed retries, the entry is marked permanently failed.
+ *   - Every attempt (success or failure) is logged to `webhook_delivery_log`.
  */
 
 import { createHmac, randomBytes } from 'crypto';
 import type { DrizzleDb } from './drizzle-types';
-import { webhooks } from './schema';
+import {
+  webhooks,
+  webhookDeliveryLog,
+  webhookDeadLetterQueue,
+  WEBHOOK_RETRY_DELAYS_MS,
+} from './schema';
 import { eq, and } from 'drizzle-orm';
 import type {
   WebhookEventBase,
@@ -29,9 +36,7 @@ import type {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 10_000; // 10-second timeout per attempt
-const DEFAULT_RETRY_BASE_DELAY_MS = 1_000; // 1s, 2s, 4s
 
 // ── Default logger ────────────────────────────────────────────────────────────
 
@@ -47,7 +52,7 @@ const defaultLogger = {
  * Sign a JSON payload body with HMAC-SHA256.
  * Returns the hex digest prefixed with "sha256=".
  */
-function signPayload(body: string, secret: string): string {
+export function signPayload(body: string, secret: string): string {
   const hmac = createHmac('sha256', secret);
   hmac.update(body, 'utf8');
   return `sha256=${hmac.digest('hex')}`;
@@ -65,18 +70,19 @@ export function generateWebhookSecret(): string {
 
 /**
  * Attempt a single HTTP POST to the given URL with the signed payload.
- * Returns the HTTP status code, or throws on network error / timeout.
+ * Returns { statusCode, durationMs, error? }.
  */
-async function deliverOnce(
+export async function attemptDelivery(
   url: string,
   body: string,
   signature: string,
   deliveryId: string,
   timeoutMs: number,
   signatureHeader: string,
-): Promise<number> {
+): Promise<{ statusCode: number | null; durationMs: number; error?: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const start = Date.now();
 
   try {
     const res = await fetch(url, {
@@ -85,202 +91,195 @@ async function deliverOnce(
         'Content-Type': 'application/json',
         [signatureHeader]: signature,
         'X-Webhook-Delivery': deliveryId,
-        'User-Agent': 'Krakaw-Webhooks/1.0',
+        'User-Agent': 'Krakaw-Webhooks/2.0',
       },
       body,
       signal: controller.signal,
     });
-    return res.status;
+
+    const durationMs = Date.now() - start;
+    return { statusCode: res.status, durationMs };
+  } catch (err: unknown) {
+    const durationMs = Date.now() - start;
+    const error =
+      err instanceof Error ? err.message : 'Unknown network error';
+    return { statusCode: null, durationMs, error };
   } finally {
     clearTimeout(timer);
   }
 }
 
-/**
- * Deliver a webhook with exponential-back-off retry.
- * Returns { status, ok } where ok is true if a 2xx was received.
- */
-async function deliverWithRetry(
-  webhookId: string,
-  url: string,
-  body: string,
-  signature: string,
-  deliveryId: string,
-  config: Required<WebhookConfig>,
-): Promise<DeliveryResult> {
-  let lastStatus = 0;
+// ── Service ───────────────────────────────────────────────────────────────────
 
-  for (let attempt = 0; attempt < config.maxRetries; attempt++) {
-    if (attempt > 0) {
-      const delay = config.retryBaseDelayMs * 2 ** (attempt - 1);
-      await new Promise((res) => setTimeout(res, delay));
-    }
-
-    try {
-      lastStatus = await deliverOnce(
-        url,
-        body,
-        signature,
-        deliveryId,
-        config.timeoutMs,
-        'X-Webhook-Signature',
-      );
-      if (lastStatus >= 200 && lastStatus < 300) {
-        config.logger.info(
-          { webhookId, url, status: lastStatus, attempt: attempt + 1 },
-          '[Webhooks] Delivered successfully',
-        );
-        return { status: lastStatus, ok: true };
-      }
-      config.logger.warn(
-        { webhookId, url, status: lastStatus, attempt: attempt + 1 },
-        '[Webhooks] Non-2xx response, will retry',
-      );
-    } catch (err) {
-      config.logger.warn(
-        { webhookId, url, err, attempt: attempt + 1 },
-        '[Webhooks] Delivery failed (network/timeout), will retry',
-      );
-    }
-  }
-
-  return { status: lastStatus, ok: false };
+export interface WebhookServiceConfig {
+  /** Timeout per HTTP attempt (default: 10s) */
+  timeoutMs?: number;
+  /** Optional logger (defaults to console) */
+  logger?: {
+    info: (obj: unknown, msg: string) => void;
+    warn: (obj: unknown, msg: string) => void;
+    error: (obj: unknown, msg: string) => void;
+  };
+  /** Custom signature header name (default: 'X-Webhook-Signature') */
+  signatureHeader?: string;
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
-
 /**
- * Create a webhook delivery service instance.
- * 
- * @param db - Drizzle database instance
- * @param config - Optional configuration overrides
- * 
- * @example
- * ```typescript
- * import { createWebhookService } from '@krakaw/webhooks';
- * import { db } from './db';
- * 
- * const webhookService = createWebhookService(db);
- * 
- * // Fire an event
- * await webhookService.fireEvent('booking.created', {
- *   bookingId: 'abc123',
- *   slotStart: '2026-02-20T14:00:00Z'
- * }, userId);
- * ```
+ * Webhook delivery service.
+ *
+ * Usage:
+ *   const service = createWebhookService(db, config);
+ *   await service.fireEvent('booking.created', { bookingId: '123' }, 'user-1');
  */
-export function createWebhookService(
+export function createWebhookService<TEvent extends WebhookEventBase>(
   db: DrizzleDb,
-  config: WebhookConfig = {},
+  config: WebhookServiceConfig = {},
 ) {
-  const fullConfig: Required<WebhookConfig> = {
-    maxRetries: config.maxRetries ?? DEFAULT_MAX_RETRIES,
-    timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    retryBaseDelayMs: config.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
-    logger: config.logger ?? defaultLogger,
-  };
+  const {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    logger = defaultLogger,
+    signatureHeader = 'X-Webhook-Signature',
+  } = config;
 
   /**
-   * Fire a webhook event for the given user.
+   * Fire a webhook event to all matching webhooks for the given user.
    *
-   * Fetches all enabled webhooks for the user that subscribe to this event
-   * (or have an empty events list = "all events"), and delivers the payload
-   * to each concurrently.
-   *
-   * This function never throws — failures are logged and persisted to the DB.
-   * Call it with fire-and-forget from route handlers:
-   *
-   *   webhookService.fireEvent('event.name', data, userId).catch(() => {});
+   * @param event - The event type (e.g. 'booking.created')
+   * @param data - Event-specific payload data
+   * @param userId - The user whose webhooks to trigger
+   * @returns Array of delivery results (one per webhook)
    */
-  async function fireEvent<TEvent extends WebhookEventBase>(
+  async function fireEvent(
     event: TEvent,
     data: Record<string, unknown>,
     userId: string,
-  ): Promise<void> {
-    // Fetch all enabled webhooks for this user
-    let userWebhooks;
-    try {
-      userWebhooks = await db
-        .select()
-        .from(webhooks)
-        .where(and(eq(webhooks.userId, userId), eq(webhooks.enabled, true)));
-    } catch (err) {
-      fullConfig.logger.error(
-        { err, userId, event },
-        '[Webhooks] Failed to fetch webhooks from DB',
+  ): Promise<DeliveryResult[]> {
+    // 1. Fetch all enabled webhooks for this user that subscribe to this event
+    const userWebhooks = await db
+      .select()
+      .from(webhooks)
+      .where(and(eq(webhooks.userId, userId), eq(webhooks.enabled, true)));
+
+    const matchingWebhooks = userWebhooks.filter((wh) => {
+      const subscribedEvents = wh.events as string[];
+      return (
+        subscribedEvents.length === 0 || subscribedEvents.includes(event)
       );
-      return;
-    }
-
-    if (userWebhooks.length === 0) return;
-
-    // Filter to webhooks that subscribe to this event
-    const targets = userWebhooks.filter((wh) => {
-      const events = wh.events as string[];
-      return events.length === 0 || events.includes(event);
     });
 
-    if (targets.length === 0) return;
+    if (matchingWebhooks.length === 0) {
+      logger.info({ event, userId }, 'No matching webhooks');
+      return [];
+    }
 
+    // 2. Deliver to each webhook (in parallel)
+    const results = await Promise.all(
+      matchingWebhooks.map((wh) => deliverToWebhook(wh, event, data)),
+    );
+
+    return results;
+  }
+
+  /**
+   * Deliver a single webhook event.
+   * Logs to delivery_log, updates the webhook record, and enqueues to DLQ on failure.
+   */
+  async function deliverToWebhook(
+    webhook: typeof webhooks.$inferSelect,
+    event: TEvent,
+    data: Record<string, unknown>,
+  ): Promise<DeliveryResult> {
     const deliveryId = randomBytes(16).toString('hex');
-    const timestamp = new Date().toISOString();
-
     const payload: WebhookPayload<TEvent> = {
       deliveryId,
       event,
-      timestamp,
+      timestamp: new Date().toISOString(),
       data,
     };
 
     const body = JSON.stringify(payload);
+    const signature = signPayload(body, webhook.secret);
 
-    // Deliver to all matching webhooks concurrently
-    await Promise.allSettled(
-      targets.map(async (wh) => {
-        const signature = signPayload(body, wh.secret);
-
-        const { status, ok } = await deliverWithRetry(
-          wh.id,
-          wh.url,
-          body,
-          signature,
-          deliveryId,
-          fullConfig,
-        );
-
-        // Update delivery metadata in DB (best-effort)
-        try {
-          const now = new Date();
-          if (ok) {
-            await db
-              .update(webhooks)
-              .set({
-                lastDeliveredAt: now,
-                lastDeliveryStatus: status,
-                updatedAt: now,
-              } as any)
-              .where(eq(webhooks.id, wh.id));
-          } else {
-            await db
-              .update(webhooks)
-              .set({
-                lastFailedAt: now,
-                lastDeliveryStatus: status,
-                updatedAt: now,
-              } as any)
-              .where(eq(webhooks.id, wh.id));
-          }
-        } catch (err) {
-          fullConfig.logger.error(
-            { err, webhookId: wh.id },
-            '[Webhooks] Failed to update delivery metadata',
-          );
-        }
-      }),
+    // Attempt delivery
+    const start = Date.now();
+    const { statusCode, durationMs, error } = await attemptDelivery(
+      webhook.url,
+      body,
+      signature,
+      deliveryId,
+      timeoutMs,
+      signatureHeader,
     );
+
+    const success = statusCode !== null && statusCode >= 200 && statusCode < 300;
+
+    // Log the attempt
+    await db.insert(webhookDeliveryLog).values({
+      webhookId: webhook.id,
+      deliveryId,
+      event,
+      url: webhook.url,
+      attempt: 1,
+      statusCode,
+      success,
+      error: error ?? null,
+      durationMs,
+    });
+
+    // Update webhook record
+    if (success) {
+      await db
+        .update(webhooks)
+        .set({
+          lastDeliveredAt: new Date(),
+          lastDeliveryStatus: statusCode,
+          updatedAt: new Date(),
+        })
+        .where(eq(webhooks.id, webhook.id));
+
+      logger.info(
+        { webhookId: webhook.id, event, statusCode, durationMs },
+        'Webhook delivered successfully',
+      );
+    } else {
+      // Failed — update webhook and enqueue to DLQ
+      await db
+        .update(webhooks)
+        .set({
+          lastFailedAt: new Date(),
+          lastDeliveryStatus: statusCode,
+          updatedAt: new Date(),
+        })
+        .where(eq(webhooks.id, webhook.id));
+
+      // Enqueue to DLQ for retry
+      const nextRetryAt = new Date(Date.now() + WEBHOOK_RETRY_DELAYS_MS[0]);
+      await db.insert(webhookDeadLetterQueue).values({
+        webhookId: webhook.id,
+        deliveryId,
+        event,
+        payload: body, // Store as TEXT to preserve HMAC signature
+        attemptCount: 0,
+        nextRetryAt,
+        failedPermanently: false,
+        lastError: error ?? `HTTP ${statusCode}`,
+        lastStatusCode: statusCode,
+      });
+
+      logger.warn(
+        { webhookId: webhook.id, event, error, statusCode },
+        'Webhook delivery failed — enqueued to DLQ',
+      );
+    }
+
+    return {
+      webhookId: webhook.id,
+      deliveryId,
+      success,
+      statusCode,
+      error: error ?? undefined,
+    };
   }
 
-  return {
-    fireEvent,
-  };
+  return { fireEvent };
 }

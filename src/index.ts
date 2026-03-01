@@ -1,56 +1,71 @@
 /**
- * @krakaw/webhooks
+ * @krakaw/webhooks - Unified Webhook Infrastructure
  *
- * Unified webhook infrastructure for Krakaw projects.
- *
- * Features:
- * - HMAC-SHA256 signed webhook delivery
- * - Exponential back-off retry logic
- * - Type-safe event system
- * - Drizzle ORM schema for PostgreSQL
- * - Hono routes for webhook CRUD
- * - Delivery status tracking
+ * Production-ready webhook delivery system with:
+ *   - HMAC-SHA256 signed delivery
+ *   - Dead Letter Queue (DLQ) for failed deliveries
+ *   - Automatic retry with exponential delays
+ *   - Comprehensive delivery logging
+ *   - Type-safe event system
  *
  * @example
  * ```typescript
- * import { createWebhookService, createWebhookRoutes, webhooks } from '@krakaw/webhooks';
- * import { db } from './db';
- * import { authMiddleware } from './auth/middleware';
- * 
- * // Export schema in your project's schema file
- * export { webhooks };
- * 
- * // Create delivery service
- * const webhookService = createWebhookService(db);
- * 
- * // Mount routes
- * const webhookRoutes = createWebhookRoutes({
- *   db,
- *   webhookService,
- *   authMiddleware,
- *   validEvents: ['booking.created', 'booking.cancelled'],
+ * import { createWebhookService, startWebhookRetryJob } from '@krakaw/webhooks';
+ *
+ * // 1. Create delivery service
+ * const webhookService = createWebhookService(db, {
+ *   timeoutMs: 10_000,
+ *   signatureHeader: 'X-MyApp-Signature',
  * });
- * 
- * app.route('/webhooks', webhookRoutes);
- * 
- * // Fire events from your business logic
- * await webhookService.fireEvent('booking.created', {
- *   bookingId: 'abc123',
- *   slotStart: '2026-02-20T14:00:00Z'
- * }, userId);
+ *
+ * // 2. Start retry job (polls DLQ every 30s)
+ * const stopRetryJob = startWebhookRetryJob(db, {
+ *   pollIntervalMs: 30_000,
+ * });
+ *
+ * // 3. Fire events from your business logic
+ * await webhookService.fireEvent('booking.created', { bookingId: '123' }, 'user-1');
  * ```
  */
 
-export { createWebhookService, generateWebhookSecret } from './delivery';
-export { createWebhookRoutes } from './routes';
-export { webhooks } from './schema';
-export type { WebhookInsert, WebhookSelect } from './schema';
+// ── Schema ────────────────────────────────────────────────────────────────────
+export {
+  webhooks,
+  webhookDeliveryLog,
+  webhookDeadLetterQueue,
+  WEBHOOK_RETRY_DELAYS_MS,
+  MAX_DLQ_ATTEMPTS,
+  type Webhook,
+  type NewWebhook,
+  type WebhookDeliveryLog,
+  type NewWebhookDeliveryLog,
+  type WebhookDeadLetterEntry,
+  type NewWebhookDeadLetterEntry,
+} from './schema';
+
+// ── Delivery Service ──────────────────────────────────────────────────────────
+export {
+  createWebhookService,
+  generateWebhookSecret,
+  signPayload,
+  attemptDelivery,
+  type WebhookServiceConfig,
+} from './delivery';
+
+// ── Retry Job ─────────────────────────────────────────────────────────────────
+export {
+  startWebhookRetryJob,
+  DLQ_QUERY_LIMIT,
+  type RetryJobConfig,
+} from './retryJob';
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 export type {
   WebhookEventBase,
   WebhookPayload,
-  Webhook,
-  CreateWebhookInput,
-  UpdateWebhookInput,
   WebhookConfig,
   DeliveryResult,
 } from './types';
+
+// ── Hono Routes (optional) ────────────────────────────────────────────────────
+export { createWebhookRoutes } from './routes';
