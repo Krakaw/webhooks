@@ -55,4 +55,4 @@ export type {
   WebhookConfig,
   DeliveryResult,
 } from './types';
-export type { DeadLetterEntry, DlqEntry, DlqConfig, DlqService } from './dlq';
+export type { DeadLetterEntry, DlqConfig, DlqService } from './dlq';

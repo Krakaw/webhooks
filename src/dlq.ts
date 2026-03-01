@@ -29,8 +29,6 @@ export interface DeadLetterEntry {
   retryCount: number;
 }
 
-export interface DlqEntry extends DeadLetterEntry {}
-
 export interface DlqConfig {
   /**
    * Optional path to a SQLite database file for persistent storage.
@@ -84,7 +82,8 @@ function openSqlite(path: string): SqliteDb | null {
       )
     `);
     return db;
-  } catch {
+  } catch (err) {
+    console.error('[Webhooks/DLQ] Failed to open SQLite:', err);
     return null;
   }
 }
@@ -188,16 +187,6 @@ export function createDlqService(config: DlqConfig = {}) {
       return row ? rowToEntry(row) : undefined;
     }
     return inMemory.get(id);
-  }
-
-  // Sync SQLite → in-memory on startup so retryDeadLetter works offline
-  if (sqlite) {
-    for (const row of sqlite
-      .prepare('SELECT * FROM webhook_dead_letter_queue')
-      .all()) {
-      const entry = rowToEntry(row);
-      inMemory.set(entry.id, entry);
-    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -305,13 +294,6 @@ export function createDlqService(config: DlqConfig = {}) {
         remove(entry.id);
         count++;
       }
-    }
-
-    if (sqlite) {
-      // Also purge from SQLite for entries that might not be in memory map
-      sqlite
-        .prepare('DELETE FROM webhook_dead_letter_queue WHERE failed_at < ?')
-        .run(cutoff.toISOString());
     }
 
     logger.info({ count, olderThanDays }, '[Webhooks/DLQ] Purged old entries');

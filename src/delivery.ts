@@ -320,7 +320,21 @@ export function createWebhookService(
       const fn =
         deliverFn ??
         (async (entry) => {
-          const sig = signPayload(entry.payload, '');
+          // Look up the webhook record to get the real signing secret
+          const [wh] = await db
+            .select()
+            .from(webhooks)
+            .where(eq(webhooks.id, entry.webhookId))
+            .limit(1);
+          if (!wh) {
+            fullConfig.logger.warn(
+              { webhookId: entry.webhookId },
+              '[Webhooks] Webhook not found for DLQ retry — cannot sign payload',
+            );
+            return false;
+          }
+          const sig = signPayload(entry.payload, wh.secret);
+          const signatureHeader = `X-Webhook-Signature`;
           try {
             const retryDeliveryId = randomBytes(16).toString('hex');
             const status = await deliverOnce(
@@ -329,7 +343,7 @@ export function createWebhookService(
               sig,
               retryDeliveryId,
               fullConfig.timeoutMs,
-              'X-Webhook-Signature',
+              signatureHeader,
             );
             return status >= 200 && status < 300;
           } catch {
