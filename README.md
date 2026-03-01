@@ -149,6 +149,24 @@ const webhookService = createWebhookService(db, {
 });
 ```
 
+## Publishing
+
+Releases are published to [GitHub Packages](https://github.com/Krakaw/webhooks/pkgs/npm/webhooks) automatically when a semver tag is pushed:
+
+```bash
+# Bump version in package.json first, then:
+git tag v1.2.3
+git push --tags
+```
+
+The CI pipeline (`.github/workflows/npm-publish.yml`) uses the shared
+[`Krakaw/.github` reusable workflow](https://github.com/Krakaw/.github) and will:
+1. Run `npm ci` + `npm run build`
+2. Publish with npm provenance attestation (SLSA Level 2)
+3. Create a GitHub Release with auto-generated notes
+
+---
+
 ## Projects Using This Package
 
 - **Calendr** — Booking lifecycle events (created, confirmed, cancelled, rescheduled)
