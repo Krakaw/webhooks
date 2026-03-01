@@ -44,6 +44,7 @@
 export { createWebhookService, generateWebhookSecret } from './delivery';
 export { createWebhookRoutes } from './routes';
 export { webhooks } from './schema';
+export { createDlqService } from './dlq';
 export type { WebhookInsert, WebhookSelect } from './schema';
 export type {
   WebhookEventBase,
@@ -54,3 +55,4 @@ export type {
   WebhookConfig,
   DeliveryResult,
 } from './types';
+export type { DeadLetterEntry, DlqEntry, DlqConfig, DlqService } from './dlq';

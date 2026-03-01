@@ -26,6 +26,7 @@ import type {
   WebhookConfig,
   DeliveryResult,
 } from './types';
+import { createDlqService, type DlqService, type DlqConfig } from './dlq';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -169,10 +170,19 @@ async function deliverWithRetry(
  * }, userId);
  * ```
  */
+// Re-export DlqConfig so consumers don't need to import from dlq directly
+export type { DlqConfig, DlqService };
+
 export function createWebhookService(
   db: DrizzleDb,
   config: WebhookConfig = {},
+  dlqConfig?: DlqConfig | DlqService,
 ) {
+  // Accept either a pre-built DlqService or config to build one
+  const dlq: DlqService =
+    dlqConfig && typeof (dlqConfig as DlqService).enqueue === 'function'
+      ? (dlqConfig as DlqService)
+      : createDlqService((dlqConfig as DlqConfig | undefined) ?? {});
   const fullConfig: Required<WebhookConfig> = {
     maxRetries: config.maxRetries ?? DEFAULT_MAX_RETRIES,
     timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -269,6 +279,18 @@ export function createWebhookService(
                 updatedAt: now,
               } as any)
               .where(eq(webhooks.id, wh.id));
+
+            // Move to Dead Letter Queue after all retries exhausted
+            dlq.enqueue({
+              webhookId: wh.id,
+              payload: body,
+              endpointUrl: wh.url,
+              failureReason:
+                status === 0
+                  ? 'Network error or timeout after all retries'
+                  : `HTTP ${status} after all retries`,
+              retryCount: fullConfig.maxRetries,
+            });
           }
         } catch (err) {
           fullConfig.logger.error(
@@ -282,5 +304,46 @@ export function createWebhookService(
 
   return {
     fireEvent,
+    /** Return all entries currently in the Dead Letter Queue */
+    listDeadLetters: dlq.listDeadLetters.bind(dlq),
+    /**
+     * Retry a specific DLQ entry.
+     * @param id - DLQ entry ID
+     * @param deliverFn - async function that receives the entry and returns
+     *   true on success. If omitted, the service will attempt re-delivery
+     *   automatically using the original payload.
+     */
+    retryDeadLetter: async (
+      id: string,
+      deliverFn?: (entry: import('./dlq').DeadLetterEntry) => Promise<boolean>,
+    ): Promise<boolean> => {
+      const fn =
+        deliverFn ??
+        (async (entry) => {
+          const sig = signPayload(entry.payload, '');
+          try {
+            const retryDeliveryId = randomBytes(16).toString('hex');
+            const status = await deliverOnce(
+              entry.endpointUrl,
+              entry.payload,
+              sig,
+              retryDeliveryId,
+              fullConfig.timeoutMs,
+              'X-Webhook-Signature',
+            );
+            return status >= 200 && status < 300;
+          } catch {
+            return false;
+          }
+        });
+      return dlq.retryDeadLetter(id, fn);
+    },
+    /**
+     * Purge DLQ entries older than `olderThanDays` days.
+     * @returns Number of entries removed.
+     */
+    purgeDeadLetters: dlq.purgeDeadLetters.bind(dlq),
+    /** Direct access to the underlying DLQ service */
+    dlq,
   };
 }
