@@ -6,7 +6,8 @@
  *
  * Security:
  *   Every payload is signed with HMAC-SHA256 using the webhook's stored secret.
- *   The signature is sent in the `X-{ProjectName}-Signature` header as `sha256=<hex>`.
+ *   The signature is sent in a configurable header (default: `X-Webhook-Signature`) as `sha256=<hex>`.
+ *   Override via `WebhookConfig.signatureHeader`.
  *   Consumers should verify the signature before processing events.
  *
  * Retry strategy:
@@ -124,7 +125,7 @@ async function deliverWithRetry(
         signature,
         deliveryId,
         config.timeoutMs,
-        'X-Webhook-Signature',
+        config.signatureHeader,
       );
       if (lastStatus >= 200 && lastStatus < 300) {
         config.logger.info(
@@ -188,6 +189,7 @@ export function createWebhookService(
     timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     retryBaseDelayMs: config.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
     logger: config.logger ?? defaultLogger,
+    signatureHeader: config.signatureHeader ?? 'X-Webhook-Signature',
   };
 
   /**
@@ -334,7 +336,7 @@ export function createWebhookService(
             return false;
           }
           const sig = signPayload(entry.payload, wh.secret);
-          const signatureHeader = `X-Webhook-Signature`;
+          const signatureHeader = fullConfig.signatureHeader;
           try {
             const retryDeliveryId = randomBytes(16).toString('hex');
             const status = await deliverOnce(
