@@ -45,12 +45,15 @@ describe('DLQ Service', () => {
     expect(dlq.listDeadLetters()).toHaveLength(1);
   });
 
-  it('purgeDeadLetters(0) removes all entries', () => {
+  it('purgeDeadLetters(0) removes all entries', async () => {
     const dlq = createDlqService();
     dlq.enqueue(makeEntry());
     dlq.enqueue(makeEntry({ webhookId: 'wh-2' }));
 
     expect(dlq.listDeadLetters()).toHaveLength(2);
+
+    // Wait a tick so failedAt < cutoff (not same millisecond as purge call)
+    await new Promise((r) => setTimeout(r, 5));
 
     const purged = dlq.purgeDeadLetters(0);
 
