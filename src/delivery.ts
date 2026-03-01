@@ -6,7 +6,8 @@
  *
  * Security:
  *   Every payload is signed with HMAC-SHA256 using the webhook's stored secret.
- *   The signature is sent in the `X-{ProjectName}-Signature` header as `sha256=<hex>`.
+ *   The signature is sent in a configurable header (default: `X-Webhook-Signature`) as `sha256=<hex>`.
+ *   Override via `WebhookConfig.signatureHeader`.
  *   Consumers should verify the signature before processing events.
  *
  * Retry strategy:
@@ -26,6 +27,7 @@ import type {
   WebhookConfig,
   DeliveryResult,
 } from './types';
+import { createDlqService, type DlqService, type DlqConfig } from './dlq';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -123,7 +125,7 @@ async function deliverWithRetry(
         signature,
         deliveryId,
         config.timeoutMs,
-        'X-Webhook-Signature',
+        config.signatureHeader,
       );
       if (lastStatus >= 200 && lastStatus < 300) {
         config.logger.info(
@@ -169,15 +171,25 @@ async function deliverWithRetry(
  * }, userId);
  * ```
  */
+// Re-export DlqConfig so consumers don't need to import from dlq directly
+export type { DlqConfig, DlqService };
+
 export function createWebhookService(
   db: DrizzleDb,
   config: WebhookConfig = {},
+  dlqConfig?: DlqConfig | DlqService,
 ) {
+  // Accept either a pre-built DlqService or config to build one
+  const dlq: DlqService =
+    dlqConfig && typeof (dlqConfig as DlqService).enqueue === 'function'
+      ? (dlqConfig as DlqService)
+      : createDlqService((dlqConfig as DlqConfig | undefined) ?? {});
   const fullConfig: Required<WebhookConfig> = {
     maxRetries: config.maxRetries ?? DEFAULT_MAX_RETRIES,
     timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     retryBaseDelayMs: config.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
     logger: config.logger ?? defaultLogger,
+    signatureHeader: config.signatureHeader ?? 'X-Webhook-Signature',
   };
 
   /**
@@ -269,6 +281,18 @@ export function createWebhookService(
                 updatedAt: now,
               } as any)
               .where(eq(webhooks.id, wh.id));
+
+            // Move to Dead Letter Queue after all retries exhausted
+            dlq.enqueue({
+              webhookId: wh.id,
+              payload: body,
+              endpointUrl: wh.url,
+              failureReason:
+                status === 0
+                  ? 'Network error or timeout after all retries'
+                  : `HTTP ${status} after all retries`,
+              retryCount: fullConfig.maxRetries,
+            });
           }
         } catch (err) {
           fullConfig.logger.error(
@@ -282,5 +306,60 @@ export function createWebhookService(
 
   return {
     fireEvent,
+    /** Return all entries currently in the Dead Letter Queue */
+    listDeadLetters: dlq.listDeadLetters.bind(dlq),
+    /**
+     * Retry a specific DLQ entry.
+     * @param id - DLQ entry ID
+     * @param deliverFn - async function that receives the entry and returns
+     *   true on success. If omitted, the service will attempt re-delivery
+     *   automatically using the original payload.
+     */
+    retryDeadLetter: async (
+      id: string,
+      deliverFn?: (entry: import('./dlq').DeadLetterEntry) => Promise<boolean>,
+    ): Promise<boolean> => {
+      const fn =
+        deliverFn ??
+        (async (entry) => {
+          // Look up the webhook record to get the real signing secret
+          const [wh] = await db
+            .select()
+            .from(webhooks)
+            .where(eq(webhooks.id, entry.webhookId))
+            .limit(1);
+          if (!wh) {
+            fullConfig.logger.warn(
+              { webhookId: entry.webhookId },
+              '[Webhooks] Webhook not found for DLQ retry — cannot sign payload',
+            );
+            return false;
+          }
+          const sig = signPayload(entry.payload, wh.secret);
+          const signatureHeader = fullConfig.signatureHeader;
+          try {
+            const retryDeliveryId = randomBytes(16).toString('hex');
+            const status = await deliverOnce(
+              entry.endpointUrl,
+              entry.payload,
+              sig,
+              retryDeliveryId,
+              fullConfig.timeoutMs,
+              signatureHeader,
+            );
+            return status >= 200 && status < 300;
+          } catch {
+            return false;
+          }
+        });
+      return dlq.retryDeadLetter(id, fn);
+    },
+    /**
+     * Purge DLQ entries older than `olderThanDays` days.
+     * @returns Number of entries removed.
+     */
+    purgeDeadLetters: dlq.purgeDeadLetters.bind(dlq),
+    /** Direct access to the underlying DLQ service */
+    dlq,
   };
 }
