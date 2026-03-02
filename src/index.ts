@@ -62,7 +62,6 @@ export type { DeadLetterEntry, DlqConfig, DlqService } from './dlq';
 // ── Retry Job ─────────────────────────────────────────────────────────────────
 export {
   startWebhookRetryJob,
-  DLQ_QUERY_LIMIT,
 } from './retryJob';
 export type { RetryJobConfig } from './retryJob';
 

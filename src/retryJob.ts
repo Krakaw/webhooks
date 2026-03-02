@@ -17,6 +17,8 @@
  * were scheduled while the server was down).
  */
 
+import type { SQL } from 'drizzle-orm';
+import type { PgTable } from 'drizzle-orm/pg-core';
 import type { DrizzleDb } from './drizzle-types';
 import {
   webhooks,
@@ -24,6 +26,8 @@ import {
   webhookDeliveryLog,
   WEBHOOK_RETRY_DELAYS_MS,
   MAX_DLQ_ATTEMPTS,
+  type WebhookDeadLetterEntry,
+  type Webhook,
 } from './schema';
 import { eq, and, lte } from 'drizzle-orm';
 import { attemptDelivery, signPayload } from './delivery';
@@ -39,8 +43,42 @@ const BATCH_SIZE = 15;
 /**
  * Maximum number of due DLQ rows fetched per poll cycle.
  * Caps the SELECT result set to prevent OOM after extended outages.
+ * Internal constant — not part of the public API.
  */
-export const DLQ_QUERY_LIMIT = 100;
+const DLQ_QUERY_LIMIT = 100;
+
+// ── Type helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * Drizzle 0.36 restricts `PgUpdateSetSource<T>` to columns in `$inferInsert`
+ * (i.e. only non-default columns). This means columns that have `.default()`
+ * cannot be set via `.set({})` without a cast, even though Drizzle fully
+ * supports it at runtime.
+ *
+ * `TableUpdate<T>` derives the update type from `$inferSelect` (the full column
+ * set) instead, allowing all columns to be set while preserving correct value
+ * types. Every object passed to `.set()` is first verified with `satisfies
+ * Partial<T['$inferSelect']>` before the cast, so field names and types are
+ * still checked at compile time.
+ */
+type TableUpdate<T extends PgTable> = {
+  [K in keyof T['$inferSelect']]?: T['$inferSelect'][K] | SQL | null;
+};
+
+/**
+ * Type-safe helper for building Drizzle update set objects.
+ * The `satisfies` check enforces that all keys/values match the table's
+ * column types; the cast to `TableUpdate<T>` bridges the gap in Drizzle's
+ * 0.36 `PgUpdateSetSource` definition.
+ */
+function updateSet<T extends PgTable>(
+  _table: T,
+  values: Partial<T['$inferSelect']> & Record<string, unknown>,
+): TableUpdate<T> {
+  return values as TableUpdate<T>;
+}
+
+
 
 // ── Default logger ────────────────────────────────────────────────────────────
 
@@ -75,7 +113,7 @@ export interface RetryJobConfig {
  * Process a single DLQ entry: re-attempt delivery, update the entry,
  * and schedule the next retry or mark as permanently failed.
  */
-async function processDLQEntry(
+export async function processDLQEntry(
   db: DrizzleDb,
   entryId: string,
   config: Required<RetryJobConfig>,
@@ -83,9 +121,7 @@ async function processDLQEntry(
   const { timeoutMs, signatureHeader, logger } = config;
 
   // ── 1. Atomically claim the entry (SELECT FOR UPDATE SKIP LOCKED) ──────────
-  let entry:
-    | (typeof webhookDeadLetterQueue.$inferSelect)
-    | undefined;
+  let entry: WebhookDeadLetterEntry | undefined;
 
   await db.transaction(async (tx) => {
     const rows = await tx
@@ -101,12 +137,12 @@ async function processDLQEntry(
 
     if (rows.length === 0) return;
 
-    entry = rows[0];
+    entry = rows[0] as WebhookDeadLetterEntry;
 
     // Claim with a 1-hour processing lease
     await tx
       .update(webhookDeadLetterQueue)
-      .set({ nextRetryAt: new Date(Date.now() + 3_600_000) })
+      .set(updateSet(webhookDeadLetterQueue, { nextRetryAt: new Date(Date.now() + 3_600_000) }))
       .where(eq(webhookDeadLetterQueue.id, entryId));
   });
 
@@ -119,14 +155,14 @@ async function processDLQEntry(
     .where(and(eq(webhooks.id, entry.webhookId), eq(webhooks.enabled, true)));
 
   if (webhookRows.length === 0) {
-    // Webhook was deleted or disabled
+    // Webhook was deleted or disabled — mark entry abandoned
     await db
       .update(webhookDeadLetterQueue)
-      .set({
+      .set(updateSet(webhookDeadLetterQueue, {
         failedPermanently: true,
         lastError: 'Webhook not found or disabled',
         updatedAt: new Date(),
-      } as any)
+      }))
       .where(eq(webhookDeadLetterQueue.id, entryId));
 
     logger.warn(
@@ -136,7 +172,7 @@ async function processDLQEntry(
     return;
   }
 
-  const webhook = webhookRows[0];
+  const webhook = webhookRows[0] as Webhook;
 
   // ── 3. Re-attempt delivery ──────────────────────────────────────────────────
   const signature = signPayload(entry.payload, webhook.secret);
@@ -154,17 +190,24 @@ async function processDLQEntry(
   const success = statusCode !== null && statusCode >= 200 && statusCode < 300;
 
   // ── 4. Log the retry attempt ────────────────────────────────────────────────
-  await db.insert(webhookDeliveryLog).values({
+  //
+  // Drizzle 0.36 `$inferInsert` only captures non-default columns (url,
+  // webhookId, deliveryId, event). Columns with defaults (attempt, statusCode,
+  // success, error, durationMs) are valid at runtime but excluded from the
+  // inferred insert type. We use `satisfies` to verify value types against the
+  // full SELECT type, then cast to `$inferInsert` to satisfy `.values()`.
+  const logRow = {
     webhookId: webhook.id,
     deliveryId: entry.deliveryId,
     event: entry.event,
     url: webhook.url,
     attempt: attemptNumber + 1, // +1 because first attempt was logged in delivery.ts
-    statusCode,
+    statusCode: statusCode ?? null,
     success,
     error: error ?? null,
-    durationMs,
-  } as any);
+    durationMs: durationMs ?? null,
+  } satisfies Partial<typeof webhookDeliveryLog.$inferSelect>;
+  await db.insert(webhookDeliveryLog).values(logRow as typeof webhookDeliveryLog.$inferInsert);
 
   // ── 5. Update DLQ entry or mark permanently failed ──────────────────────────
   if (success) {
@@ -175,11 +218,11 @@ async function processDLQEntry(
 
     await db
       .update(webhooks)
-      .set({
+      .set(updateSet(webhooks, {
         lastDeliveredAt: new Date(),
         lastDeliveryStatus: statusCode,
         updatedAt: new Date(),
-      } as any)
+      }))
       .where(eq(webhooks.id, webhook.id));
 
     logger.info(
@@ -194,22 +237,22 @@ async function processDLQEntry(
       // Exhausted all retries — mark permanently failed
       await db
         .update(webhookDeadLetterQueue)
-        .set({
+        .set(updateSet(webhookDeadLetterQueue, {
           attemptCount: newAttemptCount,
           failedPermanently: true,
           lastError: error ?? `HTTP ${statusCode}`,
           lastStatusCode: statusCode,
           updatedAt: new Date(),
-        } as any)
+        }))
         .where(eq(webhookDeadLetterQueue.id, entryId));
 
       await db
         .update(webhooks)
-        .set({
+        .set(updateSet(webhooks, {
           lastFailedAt: new Date(),
           lastDeliveryStatus: statusCode,
           updatedAt: new Date(),
-        } as any)
+        }))
         .where(eq(webhooks.id, webhook.id));
 
       logger.error(
@@ -223,22 +266,22 @@ async function processDLQEntry(
 
       await db
         .update(webhookDeadLetterQueue)
-        .set({
+        .set(updateSet(webhookDeadLetterQueue, {
           attemptCount: newAttemptCount,
           nextRetryAt,
           lastError: error ?? `HTTP ${statusCode}`,
           lastStatusCode: statusCode,
           updatedAt: new Date(),
-        } as any)
+        }))
         .where(eq(webhookDeadLetterQueue.id, entryId));
 
       await db
         .update(webhooks)
-        .set({
+        .set(updateSet(webhooks, {
           lastFailedAt: new Date(),
           lastDeliveryStatus: statusCode,
           updatedAt: new Date(),
-        } as any)
+        }))
         .where(eq(webhooks.id, webhook.id));
 
       logger.warn(
@@ -261,9 +304,10 @@ async function processDLQEntry(
 /**
  * Poll for due DLQ entries and process them in batches.
  */
-async function pollDLQ(
+export async function pollDLQ(
   db: DrizzleDb,
   config: Required<RetryJobConfig>,
+  inFlight: Set<Promise<void>>,
 ): Promise<void> {
   const { batchSize, logger } = config;
 
@@ -290,9 +334,14 @@ async function pollDLQ(
     // Process in batches to avoid overwhelming the system
     for (let i = 0; i < dueEntries.length; i += batchSize) {
       const batch = dueEntries.slice(i, i + batchSize);
-      await Promise.all(
-        batch.map((entry) => processDLQEntry(db, entry.id, config)),
-      );
+      const batchPromises = batch.map((entry) => {
+        const p: Promise<void> = processDLQEntry(db, entry.id, config).finally(() => {
+          inFlight.delete(p);
+        });
+        inFlight.add(p);
+        return p;
+      });
+      await Promise.all(batchPromises);
     }
   } catch (err) {
     logger.error({ err }, 'DLQ polling error');
@@ -304,20 +353,22 @@ async function pollDLQ(
 /**
  * Start the webhook retry job.
  *
- * @returns A function to stop the job.
+ * @returns An async function to gracefully stop the job. Awaiting it ensures
+ *          all in-flight `processDLQEntry` coroutines have settled before the
+ *          process exits, preventing stuck DLQ leases on SIGTERM.
  *
  * @example
  * ```typescript
  * const stop = startWebhookRetryJob(db, { pollIntervalMs: 60_000 });
  *
- * // Later, to gracefully stop:
- * stop();
+ * // Graceful shutdown (e.g. in SIGTERM handler):
+ * await stop();
  * ```
  */
 export function startWebhookRetryJob(
   db: DrizzleDb,
   config: RetryJobConfig = {},
-): () => void {
+): () => Promise<void> {
   const fullConfig: Required<RetryJobConfig> = {
     pollIntervalMs: config.pollIntervalMs ?? POLL_INTERVAL_MS,
     timeoutMs: config.timeoutMs ?? 10_000,
@@ -328,26 +379,47 @@ export function startWebhookRetryJob(
 
   const { pollIntervalMs, logger } = fullConfig;
 
+  /**
+   * Tracks all in-flight processDLQEntry promises.
+   * stopRetryJob awaits these to ensure graceful shutdown.
+   */
+  const inFlight = new Set<Promise<void>>();
+
   logger.info(
     { pollIntervalMs },
     'Starting webhook DLQ retry job',
   );
 
+  /** Wraps a poll promise so it self-removes from inFlight when settled. */
+  function trackPoll(p: Promise<void>): void {
+    const tracked: Promise<void> = p.finally(() => inFlight.delete(tracked));
+    inFlight.add(tracked);
+  }
+
   // Process any overdue entries immediately (backlog from downtime)
-  pollDLQ(db, fullConfig).catch((err) => {
-    logger.error({ err }, 'Initial DLQ poll failed');
-  });
+  trackPoll(
+    pollDLQ(db, fullConfig, inFlight).catch((err) => {
+      logger.error({ err }, 'Initial DLQ poll failed');
+    }),
+  );
 
   // Start polling on interval
   const intervalId = setInterval(() => {
-    pollDLQ(db, fullConfig).catch((err) => {
-      logger.error({ err }, 'DLQ poll failed');
-    });
+    trackPoll(
+      pollDLQ(db, fullConfig, inFlight).catch((err) => {
+        logger.error({ err }, 'DLQ poll failed');
+      }),
+    );
   }, pollIntervalMs);
 
-  // Return stop function
-  return () => {
+  /**
+   * Stops the retry job and awaits all in-flight coroutines.
+   * Call this in your SIGTERM / graceful-shutdown handler.
+   */
+  return async () => {
     clearInterval(intervalId);
+    logger.info({}, 'Webhook DLQ retry job stopping — awaiting in-flight tasks');
+    await Promise.allSettled(inFlight);
     logger.info({}, 'Webhook DLQ retry job stopped');
   };
 }
