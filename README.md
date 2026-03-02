@@ -70,8 +70,8 @@ const stopRetryJob = startWebhookRetryJob(db, {
 });
 
 // Optionally, gracefully stop the job on shutdown
-process.on('SIGTERM', () => {
-  stopRetryJob();
+process.on('SIGTERM', async () => {
+  await stopRetryJob();
   process.exit(0);
 });
 ```

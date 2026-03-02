@@ -51,8 +51,6 @@ export type {
 export {
   createWebhookService,
   generateWebhookSecret,
-  signPayload,
-  attemptDelivery,
 } from './delivery';
 
 // ── DLQ ───────────────────────────────────────────────────────────────────────
