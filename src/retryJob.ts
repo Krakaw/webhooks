@@ -126,7 +126,7 @@ async function processDLQEntry(
         failedPermanently: true,
         lastError: 'Webhook not found or disabled',
         updatedAt: new Date(),
-      })
+      } as any)
       .where(eq(webhookDeadLetterQueue.id, entryId));
 
     logger.warn(
@@ -164,7 +164,7 @@ async function processDLQEntry(
     success,
     error: error ?? null,
     durationMs,
-  });
+  } as any);
 
   // ── 5. Update DLQ entry or mark permanently failed ──────────────────────────
   if (success) {
@@ -179,7 +179,7 @@ async function processDLQEntry(
         lastDeliveredAt: new Date(),
         lastDeliveryStatus: statusCode,
         updatedAt: new Date(),
-      })
+      } as any)
       .where(eq(webhooks.id, webhook.id));
 
     logger.info(
@@ -200,7 +200,7 @@ async function processDLQEntry(
           lastError: error ?? `HTTP ${statusCode}`,
           lastStatusCode: statusCode,
           updatedAt: new Date(),
-        })
+        } as any)
         .where(eq(webhookDeadLetterQueue.id, entryId));
 
       await db
@@ -209,7 +209,7 @@ async function processDLQEntry(
           lastFailedAt: new Date(),
           lastDeliveryStatus: statusCode,
           updatedAt: new Date(),
-        })
+        } as any)
         .where(eq(webhooks.id, webhook.id));
 
       logger.error(
@@ -229,7 +229,7 @@ async function processDLQEntry(
           lastError: error ?? `HTTP ${statusCode}`,
           lastStatusCode: statusCode,
           updatedAt: new Date(),
-        })
+        } as any)
         .where(eq(webhookDeadLetterQueue.id, entryId));
 
       await db
@@ -238,7 +238,7 @@ async function processDLQEntry(
           lastFailedAt: new Date(),
           lastDeliveryStatus: statusCode,
           updatedAt: new Date(),
-        })
+        } as any)
         .where(eq(webhooks.id, webhook.id));
 
       logger.warn(

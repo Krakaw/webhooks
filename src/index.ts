@@ -35,12 +35,16 @@ export {
   webhookDeadLetterQueue,
   WEBHOOK_RETRY_DELAYS_MS,
   MAX_DLQ_ATTEMPTS,
-  type Webhook,
-  type NewWebhook,
-  type WebhookDeliveryLog,
-  type NewWebhookDeliveryLog,
-  type WebhookDeadLetterEntry,
-  type NewWebhookDeadLetterEntry,
+} from './schema';
+export type {
+  Webhook,
+  NewWebhook,
+  WebhookDeliveryLog,
+  NewWebhookDeliveryLog,
+  WebhookDeadLetterEntry,
+  NewWebhookDeadLetterEntry,
+  WebhookInsert,
+  WebhookSelect,
 } from './schema';
 
 // ── Delivery Service ──────────────────────────────────────────────────────────
@@ -49,15 +53,21 @@ export {
   generateWebhookSecret,
   signPayload,
   attemptDelivery,
-  type WebhookServiceConfig,
 } from './delivery';
+
+// ── DLQ ───────────────────────────────────────────────────────────────────────
+export { createDlqService } from './dlq';
+export type { DeadLetterEntry, DlqConfig, DlqService } from './dlq';
 
 // ── Retry Job ─────────────────────────────────────────────────────────────────
 export {
   startWebhookRetryJob,
   DLQ_QUERY_LIMIT,
-  type RetryJobConfig,
 } from './retryJob';
+export type { RetryJobConfig } from './retryJob';
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+export { createWebhookRoutes } from './routes';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 export type {
@@ -66,6 +76,3 @@ export type {
   WebhookConfig,
   DeliveryResult,
 } from './types';
-
-// ── Hono Routes (optional) ────────────────────────────────────────────────────
-export { createWebhookRoutes } from './routes';

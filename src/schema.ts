@@ -231,3 +231,6 @@ export const webhookDeadLetterQueue = pgTable(
 
 export type WebhookDeadLetterEntry = typeof webhookDeadLetterQueue.$inferSelect;
 export type NewWebhookDeadLetterEntry = typeof webhookDeadLetterQueue.$inferInsert;
+
+export type WebhookInsert = typeof webhooks.$inferInsert;
+export type WebhookSelect = typeof webhooks.$inferSelect;

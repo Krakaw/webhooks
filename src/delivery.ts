@@ -6,26 +6,20 @@
  *
  * Security:
  *   Every payload is signed with HMAC-SHA256 using the webhook's stored secret.
- *   The signature is sent in the `X-Webhook-Signature` header as `sha256=<hex>`.
+ *   The signature is sent in a configurable header (default: `X-Webhook-Signature`) as `sha256=<hex>`.
+ *   Override via `WebhookConfig.signatureHeader`.
  *   Consumers should verify the signature before processing events.
  *
  * Retry strategy:
- *   - One immediate delivery attempt is made per webhook.
- *   - On failure, the delivery is placed in the `webhook_dead_letter_queue`.
- *   - The retry job (see retryJob.ts) processes the DLQ periodically.
- *   - Retry schedule: +1 min, +5 min, +30 min (configurable).
- *   - After MAX_DLQ_ATTEMPTS failed retries, the entry is marked permanently failed.
- *   - Every attempt (success or failure) is logged to `webhook_delivery_log`.
+ *   Up to MAX_RETRIES attempts with exponential back-off (1s, 2s, 4s by default).
+ *   A delivery is considered successful if the target responds with 2xx.
+ *   Failures are logged and the webhook's last_failed_at / last_delivery_status
+ *   fields are updated so the user can diagnose issues.
  */
 
 import { createHmac, randomBytes } from 'crypto';
 import type { DrizzleDb } from './drizzle-types';
-import {
-  webhooks,
-  webhookDeliveryLog,
-  webhookDeadLetterQueue,
-  WEBHOOK_RETRY_DELAYS_MS,
-} from './schema';
+import { webhooks } from './schema';
 import { eq, and } from 'drizzle-orm';
 import type {
   WebhookEventBase,
@@ -33,10 +27,13 @@ import type {
   WebhookConfig,
   DeliveryResult,
 } from './types';
+import { createDlqService, type DlqService, type DlqConfig } from './dlq';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_TIMEOUT_MS = 10_000; // 10-second timeout per attempt
+const DEFAULT_RETRY_BASE_DELAY_MS = 1_000; // 1s, 2s, 4s
 
 // ── Default logger ────────────────────────────────────────────────────────────
 
@@ -70,19 +67,18 @@ export function generateWebhookSecret(): string {
 
 /**
  * Attempt a single HTTP POST to the given URL with the signed payload.
- * Returns { statusCode, durationMs, error? }.
+ * Returns the HTTP status code, or throws on network error / timeout.
  */
-export async function attemptDelivery(
+async function deliverOnce(
   url: string,
   body: string,
   signature: string,
   deliveryId: string,
   timeoutMs: number,
   signatureHeader: string,
-): Promise<{ statusCode: number | null; durationMs: number; error?: string }> {
+): Promise<number> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const start = Date.now();
 
   try {
     const res = await fetch(url, {
@@ -96,190 +92,308 @@ export async function attemptDelivery(
       body,
       signal: controller.signal,
     });
-
-    const durationMs = Date.now() - start;
-    return { statusCode: res.status, durationMs };
-  } catch (err: unknown) {
-    const durationMs = Date.now() - start;
-    const error =
-      err instanceof Error ? err.message : 'Unknown network error';
-    return { statusCode: null, durationMs, error };
+    return res.status;
   } finally {
     clearTimeout(timer);
   }
 }
 
-// ── Service ───────────────────────────────────────────────────────────────────
-
-export interface WebhookServiceConfig {
-  /** Timeout per HTTP attempt (default: 10s) */
-  timeoutMs?: number;
-  /** Optional logger (defaults to console) */
-  logger?: {
-    info: (obj: unknown, msg: string) => void;
-    warn: (obj: unknown, msg: string) => void;
-    error: (obj: unknown, msg: string) => void;
-  };
-  /** Custom signature header name (default: 'X-Webhook-Signature') */
-  signatureHeader?: string;
-}
-
 /**
- * Webhook delivery service.
- *
- * Usage:
- *   const service = createWebhookService(db, config);
- *   await service.fireEvent('booking.created', { bookingId: '123' }, 'user-1');
+ * Attempt a single HTTP POST and return a structured result.
+ * Used by the retry job for DLQ re-delivery attempts.
+ * Returns { statusCode, durationMs, error? }.
  */
-export function createWebhookService<TEvent extends WebhookEventBase>(
-  db: DrizzleDb,
-  config: WebhookServiceConfig = {},
-) {
-  const {
-    timeoutMs = DEFAULT_TIMEOUT_MS,
-    logger = defaultLogger,
-    signatureHeader = 'X-Webhook-Signature',
-  } = config;
-
-  /**
-   * Fire a webhook event to all matching webhooks for the given user.
-   *
-   * @param event - The event type (e.g. 'booking.created')
-   * @param data - Event-specific payload data
-   * @param userId - The user whose webhooks to trigger
-   * @returns Array of delivery results (one per webhook)
-   */
-  async function fireEvent(
-    event: TEvent,
-    data: Record<string, unknown>,
-    userId: string,
-  ): Promise<DeliveryResult[]> {
-    // 1. Fetch all enabled webhooks for this user that subscribe to this event
-    const userWebhooks = await db
-      .select()
-      .from(webhooks)
-      .where(and(eq(webhooks.userId, userId), eq(webhooks.enabled, true)));
-
-    const matchingWebhooks = userWebhooks.filter((wh) => {
-      const subscribedEvents = wh.events as string[];
-      return (
-        subscribedEvents.length === 0 || subscribedEvents.includes(event)
-      );
-    });
-
-    if (matchingWebhooks.length === 0) {
-      logger.info({ event, userId }, 'No matching webhooks');
-      return [];
-    }
-
-    // 2. Deliver to each webhook (in parallel)
-    const results = await Promise.all(
-      matchingWebhooks.map((wh) => deliverToWebhook(wh, event, data)),
-    );
-
-    return results;
-  }
-
-  /**
-   * Deliver a single webhook event.
-   * Logs to delivery_log, updates the webhook record, and enqueues to DLQ on failure.
-   */
-  async function deliverToWebhook(
-    webhook: typeof webhooks.$inferSelect,
-    event: TEvent,
-    data: Record<string, unknown>,
-  ): Promise<DeliveryResult> {
-    const deliveryId = randomBytes(16).toString('hex');
-    const payload: WebhookPayload<TEvent> = {
-      deliveryId,
-      event,
-      timestamp: new Date().toISOString(),
-      data,
-    };
-
-    const body = JSON.stringify(payload);
-    const signature = signPayload(body, webhook.secret);
-
-    // Attempt delivery
-    const start = Date.now();
-    const { statusCode, durationMs, error } = await attemptDelivery(
-      webhook.url,
+export async function attemptDelivery(
+  url: string,
+  body: string,
+  signature: string,
+  deliveryId: string,
+  timeoutMs: number,
+  signatureHeader: string,
+): Promise<{ statusCode: number | null; durationMs: number; error?: string }> {
+  const start = Date.now();
+  try {
+    const statusCode = await deliverOnce(
+      url,
       body,
       signature,
       deliveryId,
       timeoutMs,
       signatureHeader,
     );
-
-    const success = statusCode !== null && statusCode >= 200 && statusCode < 300;
-
-    // Log the attempt
-    await db.insert(webhookDeliveryLog).values({
-      webhookId: webhook.id,
-      deliveryId,
-      event,
-      url: webhook.url,
-      attempt: 1,
-      statusCode,
-      success,
-      error: error ?? null,
-      durationMs,
-    });
-
-    // Update webhook record
-    if (success) {
-      await db
-        .update(webhooks)
-        .set({
-          lastDeliveredAt: new Date(),
-          lastDeliveryStatus: statusCode,
-          updatedAt: new Date(),
-        })
-        .where(eq(webhooks.id, webhook.id));
-
-      logger.info(
-        { webhookId: webhook.id, event, statusCode, durationMs },
-        'Webhook delivered successfully',
-      );
-    } else {
-      // Failed — update webhook and enqueue to DLQ
-      await db
-        .update(webhooks)
-        .set({
-          lastFailedAt: new Date(),
-          lastDeliveryStatus: statusCode,
-          updatedAt: new Date(),
-        })
-        .where(eq(webhooks.id, webhook.id));
-
-      // Enqueue to DLQ for retry
-      const nextRetryAt = new Date(Date.now() + WEBHOOK_RETRY_DELAYS_MS[0]);
-      await db.insert(webhookDeadLetterQueue).values({
-        webhookId: webhook.id,
-        deliveryId,
-        event,
-        payload: body, // Store as TEXT to preserve HMAC signature
-        attemptCount: 0,
-        nextRetryAt,
-        failedPermanently: false,
-        lastError: error ?? `HTTP ${statusCode}`,
-        lastStatusCode: statusCode,
-      });
-
-      logger.warn(
-        { webhookId: webhook.id, event, error, statusCode },
-        'Webhook delivery failed — enqueued to DLQ',
-      );
-    }
-
+    return { statusCode, durationMs: Date.now() - start };
+  } catch (err: unknown) {
     return {
-      webhookId: webhook.id,
-      deliveryId,
-      success,
-      statusCode,
-      error: error ?? undefined,
+      statusCode: null,
+      durationMs: Date.now() - start,
+      error: err instanceof Error ? err.message : 'Unknown network error',
     };
   }
+}
 
-  return { fireEvent };
+/**
+ * Deliver a webhook with exponential-back-off retry.
+ * Returns { status, ok } where ok is true if a 2xx was received.
+ */
+async function deliverWithRetry(
+  webhookId: string,
+  url: string,
+  body: string,
+  signature: string,
+  deliveryId: string,
+  config: Required<WebhookConfig>,
+): Promise<DeliveryResult> {
+  let lastStatus = 0;
+
+  for (let attempt = 0; attempt < config.maxRetries; attempt++) {
+    if (attempt > 0) {
+      const delay = config.retryBaseDelayMs * 2 ** (attempt - 1);
+      await new Promise((res) => setTimeout(res, delay));
+    }
+
+    try {
+      lastStatus = await deliverOnce(
+        url,
+        body,
+        signature,
+        deliveryId,
+        config.timeoutMs,
+        config.signatureHeader,
+      );
+      if (lastStatus >= 200 && lastStatus < 300) {
+        config.logger.info(
+          { webhookId, url, status: lastStatus, attempt: attempt + 1 },
+          '[Webhooks] Delivered successfully',
+        );
+        return { status: lastStatus, ok: true };
+      }
+      config.logger.warn(
+        { webhookId, url, status: lastStatus, attempt: attempt + 1 },
+        '[Webhooks] Non-2xx response, will retry',
+      );
+    } catch (err) {
+      config.logger.warn(
+        { webhookId, url, err, attempt: attempt + 1 },
+        '[Webhooks] Delivery failed (network/timeout), will retry',
+      );
+    }
+  }
+
+  return { status: lastStatus, ok: false };
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Create a webhook delivery service instance.
+ *
+ * @param db - Drizzle database instance
+ * @param config - Optional configuration overrides
+ * @param dlqConfig - Optional DLQ configuration or pre-built DlqService
+ *
+ * @example
+ * ```typescript
+ * import { createWebhookService } from '@krakaw/webhooks';
+ * import { db } from './db';
+ *
+ * const webhookService = createWebhookService(db);
+ *
+ * // Fire an event
+ * await webhookService.fireEvent('booking.created', {
+ *   bookingId: 'abc123',
+ *   slotStart: '2026-02-20T14:00:00Z'
+ * }, userId);
+ * ```
+ */
+// Re-export DlqConfig so consumers don't need to import from dlq directly
+export type { DlqConfig, DlqService };
+
+export function createWebhookService(
+  db: DrizzleDb,
+  config: WebhookConfig = {},
+  dlqConfig?: DlqConfig | DlqService,
+) {
+  // Accept either a pre-built DlqService or config to build one
+  const dlq: DlqService =
+    dlqConfig && typeof (dlqConfig as DlqService).enqueue === 'function'
+      ? (dlqConfig as DlqService)
+      : createDlqService((dlqConfig as DlqConfig | undefined) ?? {});
+  const fullConfig: Required<WebhookConfig> = {
+    maxRetries: config.maxRetries ?? DEFAULT_MAX_RETRIES,
+    timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    retryBaseDelayMs: config.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
+    logger: config.logger ?? defaultLogger,
+    signatureHeader: config.signatureHeader ?? 'X-Webhook-Signature',
+  };
+
+  /**
+   * Fire a webhook event for the given user.
+   *
+   * Fetches all enabled webhooks for the user that subscribe to this event
+   * (or have an empty events list = "all events"), and delivers the payload
+   * to each concurrently.
+   *
+   * This function never throws — failures are logged and persisted to the DB.
+   * Call it with fire-and-forget from route handlers:
+   *
+   *   webhookService.fireEvent('event.name', data, userId).catch(() => {});
+   */
+  async function fireEvent<TEvent extends WebhookEventBase>(
+    event: TEvent,
+    data: Record<string, unknown>,
+    userId: string,
+  ): Promise<void> {
+    // Fetch all enabled webhooks for this user
+    let userWebhooks;
+    try {
+      userWebhooks = await db
+        .select()
+        .from(webhooks)
+        .where(and(eq(webhooks.userId, userId), eq(webhooks.enabled, true)));
+    } catch (err) {
+      fullConfig.logger.error(
+        { err, userId, event },
+        '[Webhooks] Failed to fetch webhooks from DB',
+      );
+      return;
+    }
+
+    if (userWebhooks.length === 0) return;
+
+    // Filter to webhooks that subscribe to this event
+    const targets = userWebhooks.filter((wh) => {
+      const events = wh.events as string[];
+      return events.length === 0 || events.includes(event);
+    });
+
+    if (targets.length === 0) return;
+
+    const deliveryId = randomBytes(16).toString('hex');
+    const timestamp = new Date().toISOString();
+
+    const payload: WebhookPayload<TEvent> = {
+      deliveryId,
+      event,
+      timestamp,
+      data,
+    };
+
+    const body = JSON.stringify(payload);
+
+    // Deliver to all matching webhooks concurrently
+    await Promise.allSettled(
+      targets.map(async (wh) => {
+        const signature = signPayload(body, wh.secret);
+
+        const { status, ok } = await deliverWithRetry(
+          wh.id,
+          wh.url,
+          body,
+          signature,
+          deliveryId,
+          fullConfig,
+        );
+
+        // Update delivery metadata in DB (best-effort)
+        try {
+          const now = new Date();
+          if (ok) {
+            await db
+              .update(webhooks)
+              .set({
+                lastDeliveredAt: now,
+                lastDeliveryStatus: status,
+                updatedAt: now,
+              } as any)
+              .where(eq(webhooks.id, wh.id));
+          } else {
+            await db
+              .update(webhooks)
+              .set({
+                lastFailedAt: now,
+                lastDeliveryStatus: status,
+                updatedAt: now,
+              } as any)
+              .where(eq(webhooks.id, wh.id));
+
+            // Move to Dead Letter Queue after all retries exhausted
+            dlq.enqueue({
+              webhookId: wh.id,
+              payload: body,
+              endpointUrl: wh.url,
+              failureReason:
+                status === 0
+                  ? 'Network error or timeout after all retries'
+                  : `HTTP ${status} after all retries`,
+              retryCount: fullConfig.maxRetries,
+            });
+          }
+        } catch (err) {
+          fullConfig.logger.error(
+            { err, webhookId: wh.id },
+            '[Webhooks] Failed to update delivery metadata',
+          );
+        }
+      }),
+    );
+  }
+
+  return {
+    fireEvent,
+    /** Return all entries currently in the Dead Letter Queue */
+    listDeadLetters: dlq.listDeadLetters.bind(dlq),
+    /**
+     * Retry a specific DLQ entry.
+     * @param id - DLQ entry ID
+     * @param deliverFn - async function that receives the entry and returns
+     *   true on success. If omitted, the service will attempt re-delivery
+     *   automatically using the original payload.
+     */
+    retryDeadLetter: async (
+      id: string,
+      deliverFn?: (entry: import('./dlq').DeadLetterEntry) => Promise<boolean>,
+    ): Promise<boolean> => {
+      const fn =
+        deliverFn ??
+        (async (entry) => {
+          // Look up the webhook record to get the real signing secret
+          const [wh] = await db
+            .select()
+            .from(webhooks)
+            .where(eq(webhooks.id, entry.webhookId))
+            .limit(1);
+          if (!wh) {
+            fullConfig.logger.warn(
+              { webhookId: entry.webhookId },
+              '[Webhooks] Webhook not found for DLQ retry — cannot sign payload',
+            );
+            return false;
+          }
+          const sig = signPayload(entry.payload, wh.secret);
+          const signatureHeader = fullConfig.signatureHeader;
+          try {
+            const retryDeliveryId = randomBytes(16).toString('hex');
+            const status = await deliverOnce(
+              entry.endpointUrl,
+              entry.payload,
+              sig,
+              retryDeliveryId,
+              fullConfig.timeoutMs,
+              signatureHeader,
+            );
+            return status >= 200 && status < 300;
+          } catch {
+            return false;
+          }
+        });
+      return dlq.retryDeadLetter(id, fn);
+    },
+    /**
+     * Purge DLQ entries older than `olderThanDays` days.
+     * @returns Number of entries removed.
+     */
+    purgeDeadLetters: dlq.purgeDeadLetters.bind(dlq),
+    /** Direct access to the underlying DLQ service */
+    dlq,
+  };
 }

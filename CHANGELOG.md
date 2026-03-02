@@ -1,53 +1,67 @@
 # Changelog
 
-## [0.2.0] - 2026-03-01 - WIP / Draft
+All notable changes to `@krakaw/webhooks` are documented here.
 
-### Added - Production-Ready DLQ Pattern (extracted from Calendr)
+## [0.2.0] - 2026-03-01
 
-⚠️ **STATUS:** Work in progress — TypeScript compilation errors need resolution before merge.
+### Added
 
-This version extracts Calendr's battle-tested Dead Letter Queue implementation into the shared package.
+#### Dead Letter Queue (DLQ)
 
-**New schema tables:**
-- `webhook_delivery_log` — Immutable audit log of every HTTP attempt
-- `webhook_dead_letter_queue` — Persistent retry queue for failed deliveries
+When a webhook delivery fails after all retry attempts (exponential backoff),
+the failed delivery is automatically moved to a Dead Letter Queue for
+inspection, manual retry, and purging.
 
-**New functionality:**
-- `startWebhookRetryJob()` — Background job that polls DLQ and retries failed deliveries
-- Persistent retry with configurable delays (default: 1min, 5min, 30min)
-- Concurrent retry processing with SELECT FOR UPDATE SKIP LOCKED
-- Comprehensive delivery logging for debugging and observability
-- Automatic DLQ enrollment on delivery failure
+**New export: `createDlqService(config?)`**
 
-**Migration from 0.1.0:**
-- Schema is backwards compatible (adds new tables, updates existing `webhooks` table)
-- API is mostly compatible (delivery service signature unchanged)
-- New `startWebhookRetryJob(db, config)` must be called on server startup
+Standalone DLQ factory. Accepts optional `persistencePath` (path to a
+SQLite database file) for persistence across restarts. Falls back to
+in-memory if `better-sqlite3` is not installed.
 
-**Known issues (blocking release):**
-- [ ] TypeScript compilation errors in delivery.ts and retryJob.ts
-- [ ] `DeliveryResult` type mismatch between types.ts and delivery.ts
-- [ ] Drizzle type inference issues with schema updates
-- [ ] Missing tests for DLQ retry logic
+**New methods on `createWebhookService` return value:**
 
-**Why this matters:**
-Calendr built a sophisticated webhook DLQ system that solves hard problems:
-- Network failures don't lose events
-- Exponential backoff prevents thundering herd
-- Concurrent workers don't duplicate deliveries (SKIP LOCKED)
-- Full audit trail for compliance/debugging
+- `listDeadLetters()` — returns all DLQ entries, newest first.
+- `retryDeadLetter(id, deliverFn?)` — retry a specific DLQ entry. If
+  `deliverFn` is omitted the service re-attempts HTTP delivery automatically.
+  On success the entry is removed from the DLQ. On failure the retry count
+  and failure reason are updated.
+- `purgeDeadLetters(olderThanDays)` — remove DLQ entries older than the
+  given number of days. Returns the count of purged entries.
+- `dlq` — direct access to the underlying `DlqService` instance.
 
-Rather than have psych-transcribe and roundup reinvent this, we extract it once and share across the ecosystem.
+**New types:**
 
-**Next steps:**
-1. Fix TypeScript compilation (reconcile types.ts with new schema)
-2. Add integration tests for DLQ retry flow
-3. Publish 0.2.0 to npm
-4. Migrate Calendr to use shared package (dogfooding)
-5. Add DLQ support to psych-transcribe and roundup
+- `DeadLetterEntry` / `DlqEntry` — shape of a DLQ record
+  (`id`, `webhookId`, `payload`, `endpointUrl`, `failureReason`,
+  `failedAt`, `retryCount`)
+- `DlqConfig` — configuration for `createDlqService`
+- `DlqService` — return type of `createDlqService`
 
----
+**DLQ persistence (optional):**
 
-## [0.1.0] - 2026-02-20
+```typescript
+import { createWebhookService } from '@krakaw/webhooks';
 
-Initial release — basic HMAC-signed webhook delivery with in-memory exponential backoff.
+const webhookService = createWebhookService(db, {}, {
+  persistencePath: './data/dlq.sqlite',  // requires better-sqlite3
+});
+```
+
+Without `persistencePath` the DLQ is in-memory only (default).
+
+### Changed
+
+- `createWebhookService(db, config?, dlqConfig?)` — accepts an optional
+  third argument: either a `DlqConfig` object or a pre-built `DlqService`.
+
+## [0.1.0] - 2026-02-01
+
+### Added
+
+- Initial release
+- HMAC-SHA256 signed webhook delivery
+- Exponential back-off retry logic (configurable attempts/timeouts/delays)
+- Type-safe event system with `WebhookEventBase`
+- Drizzle ORM schema for PostgreSQL (`webhooks` table)
+- Hono routes for webhook CRUD (list, create, update, delete, test)
+- Delivery tracking (`lastDeliveredAt`, `lastFailedAt`, `lastDeliveryStatus`)

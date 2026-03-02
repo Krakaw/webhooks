@@ -83,6 +83,11 @@ export interface WebhookConfig {
   timeoutMs?: number;
   /** Base delay for exponential back-off (ms) */
   retryBaseDelayMs?: number;
+  /** HTTP header name used to send the HMAC-SHA256 signature.
+   * Configurable so projects can use their own branding (e.g. "X-MyApp-Signature").
+   * @default "X-Webhook-Signature"
+   */
+  signatureHeader?: string;
   /** Custom logger instance */
   logger?: {
     info: (obj: unknown, msg: string) => void;
