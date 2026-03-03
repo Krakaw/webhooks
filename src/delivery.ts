@@ -49,7 +49,7 @@ const defaultLogger = {
  * Sign a JSON payload body with HMAC-SHA256.
  * Returns the hex digest prefixed with "sha256=".
  */
-function signPayload(body: string, secret: string): string {
+export function signPayload(body: string, secret: string): string {
   const hmac = createHmac('sha256', secret);
   hmac.update(body, 'utf8');
   return `sha256=${hmac.digest('hex')}`;
@@ -87,7 +87,7 @@ async function deliverOnce(
         'Content-Type': 'application/json',
         [signatureHeader]: signature,
         'X-Webhook-Delivery': deliveryId,
-        'User-Agent': 'Krakaw-Webhooks/1.0',
+        'User-Agent': 'Krakaw-Webhooks/2.0',
       },
       body,
       signal: controller.signal,
@@ -95,6 +95,39 @@ async function deliverOnce(
     return res.status;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * Attempt a single HTTP POST and return a structured result.
+ * Used by the retry job for DLQ re-delivery attempts.
+ * Returns { statusCode, durationMs, error? }.
+ */
+export async function attemptDelivery(
+  url: string,
+  body: string,
+  signature: string,
+  deliveryId: string,
+  timeoutMs: number,
+  signatureHeader: string,
+): Promise<{ statusCode: number | null; durationMs: number; error?: string }> {
+  const start = Date.now();
+  try {
+    const statusCode = await deliverOnce(
+      url,
+      body,
+      signature,
+      deliveryId,
+      timeoutMs,
+      signatureHeader,
+    );
+    return { statusCode, durationMs: Date.now() - start };
+  } catch (err: unknown) {
+    return {
+      statusCode: null,
+      durationMs: Date.now() - start,
+      error: err instanceof Error ? err.message : 'Unknown network error',
+    };
   }
 }
 
@@ -153,17 +186,18 @@ async function deliverWithRetry(
 
 /**
  * Create a webhook delivery service instance.
- * 
+ *
  * @param db - Drizzle database instance
  * @param config - Optional configuration overrides
- * 
+ * @param dlqConfig - Optional DLQ configuration or pre-built DlqService
+ *
  * @example
  * ```typescript
  * import { createWebhookService } from '@krakaw/webhooks';
  * import { db } from './db';
- * 
+ *
  * const webhookService = createWebhookService(db);
- * 
+ *
  * // Fire an event
  * await webhookService.fireEvent('booking.created', {
  *   bookingId: 'abc123',
