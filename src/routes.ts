@@ -26,6 +26,7 @@
  */
 
 import { Hono } from 'hono';
+import type { MiddlewareHandler } from 'hono';
 import type { DrizzleDb } from './drizzle-types';
 import { webhooks } from './schema';
 import { eq, and } from 'drizzle-orm';
@@ -40,7 +41,7 @@ export interface WebhookRoutesConfig<TEvent extends WebhookEventBase = string> {
     fireEvent: (event: TEvent, data: Record<string, unknown>, userId: string) => Promise<void>;
   };
   /** Auth middleware that sets c.get('userId') */
-  authMiddleware: any;
+  authMiddleware: MiddlewareHandler;
   /** Valid event types for this project */
   validEvents: readonly TEvent[];
   /** Optional custom logger */

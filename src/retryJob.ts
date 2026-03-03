@@ -201,8 +201,8 @@ export async function processDLQEntry(
     deliveryId: entry.deliveryId,
     event: entry.event,
     url: webhook.url,
-    attempt: attemptNumber + 1, // +1 because first attempt was logged in delivery.ts
-    statusCode: statusCode ?? null,
+    attempt: attemptNumber,
+    statusCode,
     success,
     error: error ?? null,
     durationMs: durationMs ?? null,
