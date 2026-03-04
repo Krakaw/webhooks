@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: Krakaw/.github/.github/workflows/node-ci.yml@main
+    with:
+      node-version: '22'
+      run-lint: false      # no ESLint config yet
+      run-typecheck: false # no typecheck script yet
+      run-build: true
+      run-test: true
+    secrets:
+      GH_PAT: ${{ secrets.GH_PAT }}
