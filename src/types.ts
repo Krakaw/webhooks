@@ -95,6 +95,9 @@ export interface WebhookConfig {
  * Delivery result.
  */
 export interface DeliveryResult {
-  status: number;
-  ok: boolean;
+  webhookId: string;
+  deliveryId: string;
+  success: boolean;
+  statusCode: number | null;
+  error?: string;
 }

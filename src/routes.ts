@@ -37,12 +37,12 @@ export interface WebhookRoutesConfig<TEvent extends WebhookEventBase = string> {
   db: DrizzleDb;
   /** Webhook delivery service instance */
   webhookService: {
-    fireEvent: (event: TEvent, data: Record<string, unknown>, userId: string) => Promise<void>;
+    fireEvent: (event: TEvent, data: Record<string, unknown>, userId: string) => Promise<unknown>;
   };
   /** Auth middleware that sets c.get('userId') */
   authMiddleware: any;
-  /** Valid event types for this project */
-  validEvents: readonly TEvent[];
+  /** Valid event types for this project (optional — skips validation if omitted) */
+  validEvents?: readonly TEvent[];
   /** Optional custom logger */
   logger?: {
     info: (obj: unknown, msg: string) => void;
@@ -132,11 +132,13 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
     if (!Array.isArray(events)) {
       return c.json({ error: 'events must be an array' }, 400);
     }
-    const invalidEvents = events.filter((e) => !validEvents.includes(e as TEvent));
+    const invalidEvents = validEvents
+      ? events.filter((e) => !validEvents.includes(e as TEvent))
+      : [];
     if (invalidEvents.length > 0) {
       return c.json(
         {
-          error: `Invalid event types: ${invalidEvents.join(', ')}. Valid events: ${validEvents.join(', ')}`,
+          error: `Invalid event types: ${invalidEvents.join(', ')}. Valid events: ${validEvents!.join(', ')}`,
         },
         400,
       );
@@ -238,7 +240,9 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
     }
 
     if (Array.isArray(body.events)) {
-      const invalid = body.events.filter((e) => !validEvents.includes(e as TEvent));
+      const invalid = validEvents
+        ? body.events.filter((e) => !validEvents.includes(e as TEvent))
+        : [];
       if (invalid.length > 0) {
         return c.json({ error: `Invalid event types: ${invalid.join(', ')}` }, 400);
       }
@@ -317,7 +321,7 @@ export function createWebhookRoutes<TEvent extends WebhookEventBase = string>(
     };
 
     // Fire asynchronously — don't block the response waiting for delivery
-    void webhookService.fireEvent(validEvents[0], testData, userId);
+    void webhookService.fireEvent((validEvents?.[0] ?? 'test.ping') as TEvent, testData, userId);
 
     logger.info({ webhookId: id, userId, url: wh.url }, '[Webhooks] Test ping queued');
 

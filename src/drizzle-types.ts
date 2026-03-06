@@ -1,8 +1,8 @@
 /**
  * Minimal Drizzle type definitions to avoid full dependency.
- * Projects using this package should have drizzle-orm installed.
+ * Uses a structural interface to avoid class version conflicts between
+ * different installed versions of drizzle-orm.
  */
 
-import type { PgDatabase } from 'drizzle-orm/pg-core';
-
-export type DrizzleDb = PgDatabase<any, any, any>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type DrizzleDb = Record<string, any>;
